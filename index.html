@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Arduino Due - Teste USB OTG</title>
+<title>Arduino Due - Teste USB OTG v2</title>
 <style>
   :root { font-family: Arial, sans-serif; }
   body { margin:0; background:#f4f5f7; color:#1f2937; }
@@ -31,7 +31,7 @@
 <body>
 <div class="wrap">
   <div class="card">
-    <h1>Arduino Due — Teste USB OTG</h1>
+    <h1>Arduino Due — Teste USB OTG v2</h1>
     <div id="status" class="status"><span class="dot"></span>Desconectado</div>
     <button id="connect">CONECTAR AO ARDUINO</button>
   </div>
@@ -47,6 +47,11 @@
   <div class="card">
     <div class="label">Mensagens recebidas do Due</div>
     <pre id="log">Aguardando conexão...</pre>
+  </div>
+
+  <div class="card">
+    <div class="label">Diagnóstico USB</div>
+    <pre id="diag">Nenhum dispositivo inspecionado.</pre>
   </div>
 
   <div class="card warning">
@@ -101,38 +106,68 @@ async function connect() {
     if (device.configuration === null)
       await device.selectConfiguration(1);
 
-    // Procura uma interface com endpoints bulk IN e OUT.
-    let found = null;
+    // Mostra tudo o que o Android/Chrome expõe do Due e tenta cada
+    // interface que tenha endpoints BULK IN + OUT.
+    let report = [];
+    let candidates = [];
+
+    report.push(`Produto: ${device.productName || "(sem nome)"}`);
+    report.push(`VID: 0x${device.vendorId.toString(16).padStart(4,"0")}  PID: 0x${device.productId.toString(16).padStart(4,"0")}`);
+    report.push(`Configuração: ${device.configuration.configurationValue}`);
+
     for (const intf of device.configuration.interfaces) {
       for (const alt of intf.alternates) {
+        report.push(`IF ${intf.interfaceNumber} | classe 0x${alt.interfaceClass.toString(16).padStart(2,"0")} | sub 0x${alt.interfaceSubclass.toString(16).padStart(2,"0")} | prot 0x${alt.interfaceProtocol.toString(16).padStart(2,"0")}`);
+        for (const ep of alt.endpoints) {
+          report.push(`  EP ${ep.endpointNumber} ${ep.direction.toUpperCase()} ${ep.type}`);
+        }
         const inEp  = alt.endpoints.find(e => e.direction === "in"  && e.type === "bulk");
         const outEp = alt.endpoints.find(e => e.direction === "out" && e.type === "bulk");
-        if (inEp && outEp) {
-          found = { intf, alt, inEp, outEp };
-          break;
-        }
+        if (inEp && outEp) candidates.push({ intf, alt, inEp, outEp });
       }
-      if (found) break;
     }
 
-    if (!found) throw new Error("Não encontrei endpoints USB de dados IN/OUT.");
+    $("diag").textContent = report.join("\n");
 
-    iface = found.intf.interfaceNumber;
-    epIn = found.inEp.endpointNumber;
-    epOut = found.outEp.endpointNumber;
+    if (!candidates.length)
+      throw new Error("O Due foi aberto, mas não há interface BULK IN/OUT disponível ao WebUSB.");
 
-    await device.claimInterface(iface);
+    let claimed = null;
+    let claimErrors = [];
 
-    // Se for CDC ACM, tenta ativar DTR/RTS. Se não aceitar, seguimos.
+    for (const c of candidates) {
+      try {
+        await device.claimInterface(c.intf.interfaceNumber);
+        claimed = c;
+        break;
+      } catch (e) {
+        claimErrors.push(`IF ${c.intf.interfaceNumber}: ${e.message}`);
+      }
+    }
+
+    if (!claimed) {
+      $("diag").textContent += "\n\nFALHA AO REIVINDICAR:\n" + claimErrors.join("\n");
+      throw new Error("Due reconhecido, mas o Android/Chrome não liberou nenhuma interface BULK para a página.");
+    }
+
+    iface = claimed.intf.interfaceNumber;
+    epIn = claimed.inEp.endpointNumber;
+    epOut = claimed.outEp.endpointNumber;
+
+    $("diag").textContent += `\n\nSUCESSO: interface ${iface} reivindicada.`;
+
+    // Para CDC ACM, tenta ativar DTR/RTS. Se não aceitar, seguimos.
     try {
       await device.controlTransferOut({
         requestType: "class",
         recipient: "interface",
-        request: 0x22,       // SET_CONTROL_LINE_STATE
-        value: 0x03,         // DTR + RTS
+        request: 0x22,
+        value: 0x03,
         index: iface
       });
-    } catch(e) {}
+    } catch(e) {
+      $("diag").textContent += `\nAviso DTR/RTS: ${e.message}`;
+    }
 
     $("log").textContent = "";
     setConnected(true);
