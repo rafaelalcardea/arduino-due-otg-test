@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Arduino Due - Teste USB OTG</title>
+<style>
+  :root { font-family: Arial, sans-serif; }
+  body { margin:0; background:#f4f5f7; color:#1f2937; }
+  .wrap { max-width:560px; margin:auto; padding:18px; }
+  .card { background:white; border-radius:16px; padding:18px; margin-bottom:14px;
+          box-shadow:0 2px 10px rgba(0,0,0,.08); }
+  h1 { font-size:22px; margin:0 0 14px; }
+  .status { font-weight:700; }
+  .dot { display:inline-block; width:11px; height:11px; border-radius:50%;
+         background:#999; margin-right:7px; }
+  .connected .dot { background:#16a34a; }
+  button { width:100%; padding:15px; margin-top:10px; border:0; border-radius:11px;
+           font-size:17px; font-weight:700; cursor:pointer; }
+  #connect { background:#111827; color:white; }
+  #start { background:#16a34a; color:white; }
+  #stop { background:#dc2626; color:white; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  .big { font-size:34px; font-weight:700; margin:10px 0; }
+  .label { font-size:13px; color:#6b7280; text-transform:uppercase; }
+  pre { background:#111827; color:#e5e7eb; min-height:130px; max-height:240px;
+        overflow:auto; padding:12px; border-radius:10px; white-space:pre-wrap; }
+  .warning { font-size:14px; line-height:1.4; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>Arduino Due — Teste USB OTG</h1>
+    <div id="status" class="status"><span class="dot"></span>Desconectado</div>
+    <button id="connect">CONECTAR AO ARDUINO</button>
+  </div>
+
+  <div class="card">
+    <div class="label">P1 — pino 22</div>
+    <div id="state" class="big">Aguardando</div>
+    <div>Tempo decorrido: <strong id="time">0.0 s</strong></div>
+    <button id="start" disabled>INICIAR P1</button>
+    <button id="stop" disabled>PARAR</button>
+  </div>
+
+  <div class="card">
+    <div class="label">Mensagens recebidas do Due</div>
+    <pre id="log">Aguardando conexão...</pre>
+  </div>
+
+  <div class="card warning">
+    <strong>Conexão:</strong> use a <strong>Native USB Port</strong> do Arduino Due.
+    Esta página usa WebUSB para tentar comunicar diretamente com o Due pelo navegador.
+  </div>
+</div>
+
+<script>
+let device = null;
+let iface = null;
+let epIn = null;
+let epOut = null;
+let reading = false;
+let textBuffer = "";
+
+const $ = id => document.getElementById(id);
+const log = msg => {
+  const t = new Date().toLocaleTimeString();
+  $("log").textContent += `\n[${t}] ${msg}`;
+  $("log").scrollTop = $("log").scrollHeight;
+};
+
+function setConnected(ok) {
+  $("status").classList.toggle("connected", ok);
+  $("status").innerHTML = `<span class="dot"></span>${ok ? "Conectado" : "Desconectado"}`;
+  $("start").disabled = !ok;
+  $("stop").disabled = true;
+  $("connect").textContent = ok ? "DESCONECTAR" : "CONECTAR AO ARDUINO";
+}
+
+async function connect() {
+  if (!("usb" in navigator)) {
+    alert("Este navegador não oferece WebUSB. Tente o Chrome no Android/desktop.");
+    return;
+  }
+
+  if (device?.opened) {
+    reading = false;
+    try { await device.close(); } catch(e) {}
+    device = null;
+    setConnected(false);
+    log("Desconectado.");
+    return;
+  }
+
+  try {
+    // Sem filtro para o primeiro teste: escolha "Arduino Due" na janela.
+    device = await navigator.usb.requestDevice({ filters: [] });
+    await device.open();
+
+    if (device.configuration === null)
+      await device.selectConfiguration(1);
+
+    // Procura uma interface com endpoints bulk IN e OUT.
+    let found = null;
+    for (const intf of device.configuration.interfaces) {
+      for (const alt of intf.alternates) {
+        const inEp  = alt.endpoints.find(e => e.direction === "in"  && e.type === "bulk");
+        const outEp = alt.endpoints.find(e => e.direction === "out" && e.type === "bulk");
+        if (inEp && outEp) {
+          found = { intf, alt, inEp, outEp };
+          break;
+        }
+      }
+      if (found) break;
+    }
+
+    if (!found) throw new Error("Não encontrei endpoints USB de dados IN/OUT.");
+
+    iface = found.intf.interfaceNumber;
+    epIn = found.inEp.endpointNumber;
+    epOut = found.outEp.endpointNumber;
+
+    await device.claimInterface(iface);
+
+    // Se for CDC ACM, tenta ativar DTR/RTS. Se não aceitar, seguimos.
+    try {
+      await device.controlTransferOut({
+        requestType: "class",
+        recipient: "interface",
+        request: 0x22,       // SET_CONTROL_LINE_STATE
+        value: 0x03,         // DTR + RTS
+        index: iface
+      });
+    } catch(e) {}
+
+    $("log").textContent = "";
+    setConnected(true);
+    log(`USB aberto: ${device.productName || "Arduino Due"}`);
+    log(`Interface ${iface}, IN ${epIn}, OUT ${epOut}`);
+
+    reading = true;
+    readLoop();
+
+    await sleep(300);
+    await send("PING");
+    await send("STATUS");
+
+  } catch (e) {
+    log("ERRO: " + e.message);
+    try { if (device?.opened) await device.close(); } catch(_) {}
+    device = null;
+    setConnected(false);
+  }
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function send(cmd) {
+  if (!device?.opened) return;
+  const data = new TextEncoder().encode(cmd + "\n");
+  await device.transferOut(epOut, data);
+  log("→ " + cmd);
+}
+
+async function readLoop() {
+  while (reading && device?.opened) {
+    try {
+      const result = await device.transferIn(epIn, 64);
+      if (result.status === "ok" && result.data?.byteLength) {
+        textBuffer += new TextDecoder().decode(result.data);
+
+        let p;
+        while ((p = textBuffer.indexOf("\n")) >= 0) {
+          const line = textBuffer.slice(0, p).replace(/\r/g, "").trim();
+          textBuffer = textBuffer.slice(p + 1);
+          if (line) handleLine(line);
+        }
+      }
+    } catch (e) {
+      if (reading) log("Leitura interrompida: " + e.message);
+      reading = false;
+      setConnected(false);
+      break;
+    }
+  }
+}
+
+function handleLine(line) {
+  log("← " + line);
+  const parts = line.split("|");
+  const type = parts[0];
+
+  if (type === "PONG") {
+    $("state").textContent = "Arduino conectado";
+  }
+  else if (type === "INICIOU") {
+    $("state").textContent = "P1 em funcionamento";
+    $("start").disabled = true;
+    $("stop").disabled = false;
+  }
+  else if (type === "TEMPO") {
+    const ms = Number(parts[1]);
+    if (Number.isFinite(ms)) $("time").textContent = (ms / 1000).toFixed(1) + " s";
+  }
+  else if (type === "TERMINOU" || type === "PARADO") {
+    $("state").textContent = type === "TERMINOU" ? "P1 finalizada" : "P1 parada";
+    $("start").disabled = false;
+    $("stop").disabled = true;
+  }
+  else if (type === "STATUS") {
+    if (parts[1] === "RODANDO") {
+      $("state").textContent = "P1 em funcionamento";
+      $("start").disabled = true;
+      $("stop").disabled = false;
+      $("time").textContent = (Number(parts[2]) / 1000).toFixed(1) + " s";
+    } else {
+      $("state").textContent = "Aguardando";
+      $("start").disabled = false;
+      $("stop").disabled = true;
+    }
+  }
+}
+
+$("connect").addEventListener("click", connect);
+$("start").addEventListener("click", async () => {
+  $("time").textContent = "0.0 s";
+  await send("START");
+});
+$("stop").addEventListener("click", () => send("STOP"));
+
+navigator.usb?.addEventListener("disconnect", event => {
+  if (device && event.device === device) {
+    reading = false;
+    device = null;
+    setConnected(false);
+    log("Arduino desconectado fisicamente.");
+  }
+});
+</script>
+</body>
+</html>
